@@ -147,8 +147,10 @@ class TransactionRuntime:
         if self.submit_error is not None:
             raise self.submit_error
         if self.mode == "weak_only":
+            # pure transition signal: NO conversation observed, NO
+            # write_completed -> genuinely zero positive evidence.
             on_event({"type": "browser_native_turn_started", "submission_id": "sub-1"})
-            return FakeAck(CONV)
+            return FakeAck(None)
         if self.mode == "missing_event_id":
             # browser acks a submission id; the write_completed event omits its
             # own submission_id -> cannot be exactly correlated.
@@ -184,7 +186,12 @@ class TransactionRuntime:
 
     def _items(self, conversation_id):
         messages = list(self.conversations.get(conversation_id, []))
-        if conversation_id == CONV and messages == [] and self.submit_calls:
+        if (
+            conversation_id == CONV
+            and self.mode == "strong"
+            and messages == []
+            and self.submit_calls
+        ):
             # default conversation mirrors the last submitted prompt
             messages.append(_message("user", self.submitted_texts[-1], "u-1"))
         return messages
@@ -441,6 +448,8 @@ def test_row7_weak_signal_cannot_terminalize_write_confirmed(tmp_path):
     journal = _journal(tmp_path, request_id)
     assert journal["state"] == STATE_WRITE_FINALITY_UNKNOWN
     assert journal["writeAckTier"] == "weak"
+    # REWORK-2 audit: someone else's activity is NOT positive evidence for us.
+    assert frt._has_positive_write_evidence(journal) is False
     # Reconcile: no matching turn anywhere -> provably not ours, safe to retry.
     with pytest.raises(FinalReviewTransportError) as proven:
         _transport(runtime, tmp_path).reconcile_final_review(request_id)
@@ -458,7 +467,17 @@ def test_row7b_write_identity_must_correlate_to_this_request(tmp_path):
     with pytest.raises(FinalReviewTransportError) as raised:
         _submit(runtime, tmp_path)
     assert _code(raised.value) == "WRITE_FINALITY_UNKNOWN"
-    assert _journal(tmp_path, _journal_id(tmp_path))["writeAckTier"] == "correlated"
+    request_id = _journal_id(tmp_path)
+    journal = _journal(tmp_path, request_id)
+    assert journal["writeAckTier"] == "correlated"
+    # REWORK-2 audit: the observed conversation/foreign event is persisted as
+    # non-authoritative POSITIVE evidence, and the foreign identity granted no
+    # typed authority (WRITE_CONFIRMED never reached).
+    assert journal["conversationId"] == CONV
+    assert frt._has_positive_write_evidence(journal) is True
+    assert "sseConversationIdentityAuthority" not in journal or journal.get(
+        "sseConversationIdentityAuthority"
+    ) is None
 
 
 # ---------------------------------------------------------------------------
@@ -943,3 +962,128 @@ def test_duplicate_exact_matches_reconcile_ambiguous(tmp_path):
     )
     assert duplicate is True
     assert positive is True
+
+
+# ===========================================================================
+# REWORK-2: weak/correlated ACKs must persist their positive evidence
+# durably - a restart reconcile must never collapse an observed write into
+# NO_WRITE_PROVEN from local-memory loss.
+# ===========================================================================
+def _submit_unconfirmed(tmp_path, mode):
+    runtime = TransactionRuntime(
+        mode=mode, emit_delegation=False, conversations={}, recent=[]
+    )
+    with pytest.raises(FinalReviewTransportError) as raised:
+        _submit(runtime, tmp_path)
+    assert _code(raised.value) == "WRITE_FINALITY_UNKNOWN"
+    request_id = _journal_id(tmp_path)
+    return request_id, _journal(tmp_path, request_id)
+
+
+def test_missing_event_id_evidence_survives_restart_reconcile_ambiguous(
+    tmp_path,
+):
+    request_id, journal = _submit_unconfirmed(tmp_path, "missing_event_id")
+    # Evidence is on DISK, not in caller memory:
+    assert journal["conversationId"] == CONV
+    assert journal["uncorrelatedWriteEvents"]
+    assert journal["unconfirmedAck"]["submission_id"] == "sub-1"
+    assert frt._has_positive_write_evidence(journal) is True
+    # Fresh process, clean scan: positive evidence without an exact turn is
+    # AMBIGUOUS - never NO_WRITE_PROVEN.
+    fresh = TransactionRuntime(conversations={}, recent=[])
+    with pytest.raises(FinalReviewTransportError) as ambiguous:
+        _transport(fresh, tmp_path).reconcile_final_review(request_id)
+    assert _code(ambiguous.value) == "AMBIGUOUS_FINALITY"
+    assert ambiguous.value.safe_to_retry is False
+    assert fresh.submit_calls == 0
+    final = _journal(tmp_path, request_id)
+    assert final["state"] == STATE_AMBIGUOUS
+    assert final["ambiguousReason"] == "POSITIVE_EVIDENCE_WITHOUT_EXACT_TURN"
+
+
+def test_foreign_event_id_evidence_survives_restart_reconcile_ambiguous(
+    tmp_path,
+):
+    request_id, journal = _submit_unconfirmed(tmp_path, "mismatched_ack")
+    assert journal["conversationId"] == CONV
+    assert journal["writeAckTier"] == "correlated"
+    assert frt._has_positive_write_evidence(journal) is True
+    fresh = TransactionRuntime(conversations={}, recent=[])
+    with pytest.raises(FinalReviewTransportError) as ambiguous:
+        _transport(fresh, tmp_path).reconcile_final_review(request_id)
+    assert _code(ambiguous.value) == "AMBIGUOUS_FINALITY"
+    assert ambiguous.value.safe_to_retry is False
+    assert fresh.submit_calls == 0
+    assert _journal(tmp_path, request_id)["state"] == STATE_AMBIGUOUS
+
+
+def test_missing_event_id_exact_turn_found_is_write_found_zero_resend(tmp_path):
+    request_id, _ = _submit_unconfirmed(tmp_path, "missing_event_id")
+    fresh = TransactionRuntime(
+        conversations={
+            CONV: [
+                _message("user", PROMPT, "u-1"),
+                _message("assistant", f"verdict {HEAD}", "a-1"),
+            ]
+        },
+        recent=[],
+    )
+    result = _transport(fresh, tmp_path).reconcile_final_review(request_id)
+    assert fresh.submit_calls == 0
+    assert result.conversation_id == CONV
+    assert _journal(tmp_path, request_id)["state"] == STATE_RESPONSE_CONFIRMED
+
+
+def test_foreign_event_id_exact_turn_found_is_write_found_zero_resend(tmp_path):
+    request_id, _ = _submit_unconfirmed(tmp_path, "mismatched_ack")
+    fresh = TransactionRuntime(
+        conversations={
+            CONV: [
+                _message("user", PROMPT, "u-1"),
+                _message("assistant", f"verdict {HEAD}", "a-1"),
+            ]
+        },
+        recent=[],
+    )
+    result = _transport(fresh, tmp_path).reconcile_final_review(request_id)
+    assert fresh.submit_calls == 0
+    assert result.conversation_id == CONV
+    assert _journal(tmp_path, request_id)["state"] == STATE_RESPONSE_CONFIRMED
+
+
+def test_weak_only_zero_evidence_clean_scan_negative_control(tmp_path):
+    # NO conversation, NO write_completed, NO network: only here may the
+    # negative proof open.
+    request_id, journal = _submit_unconfirmed(tmp_path, "weak_only")
+    assert journal["writeAckTier"] == "weak"
+    assert "conversationId" not in journal or journal.get("conversationId") is None
+    assert frt._has_positive_write_evidence(journal) is False
+    with pytest.raises(FinalReviewTransportError) as proven:
+        _transport(
+            TransactionRuntime(conversations={}, recent=[]), tmp_path
+        ).reconcile_final_review(request_id)
+    assert _code(proven.value) == "NO_WRITE_PROVEN"
+    assert proven.value.safe_to_retry is True
+
+
+def test_positive_evidence_marker_unit():
+    assert frt._has_positive_write_evidence({}) is False
+    assert frt._has_positive_write_evidence({"conversationId": "  "}) is False
+    assert frt._has_positive_write_evidence({"networkEvidence": []}) is False
+    assert frt._has_positive_write_evidence({"bridgeDelegatedAtMs": 1}) is False
+    assert (
+        frt._has_positive_write_evidence({"networkEvidence": [{"atMs": 1}]}) is True
+    )
+    assert (
+        frt._has_positive_write_evidence(
+            {"uncorrelatedWriteEvents": [{"type": "browser_native_write_completed"}]}
+        )
+        is True
+    )
+    assert (
+        frt._has_positive_write_evidence(
+            {"unconfirmedAck": {"conversation_id": "conv-x"}}
+        )
+        is True
+    )

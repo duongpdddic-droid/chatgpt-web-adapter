@@ -507,6 +507,56 @@ def _classify_write_ack(
     return "weak"
 
 
+def _unconfirmed_write_evidence(
+    journal: dict[str, Any], ack_dict: dict[str, Any], events: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Non-authoritative durable evidence fields for a weak/correlated ACK.
+
+    Persisted BEFORE the UNKNOWN transition so the NEXT process (restart)
+    reconciles from the journal alone - never from this process's memory.
+    conversationId keeps its bind-once/drift semantics (correlated evidence,
+    never identity, never write proof)."""
+    fields: dict[str, Any] = {"unconfirmedAck": dict(ack_dict)}
+    observed = _is_correlation_text(ack_dict.get("conversation_id"))
+    if observed:
+        prior = journal.get("conversationId")
+        if prior in (None, ""):
+            fields["conversationId"] = observed
+        elif prior != observed:
+            fields["observedConversationDrift"] = observed
+    uncorrelated_completed = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and event.get("type") == _EVENT_WRITE_COMPLETED
+        and _strict_write_completed_event([event], ack_dict) is None
+    ]
+    if uncorrelated_completed:
+        fields["uncorrelatedWriteEvents"] = uncorrelated_completed
+    return fields
+
+
+def _has_positive_write_evidence(journal: dict[str, Any]) -> bool:
+    """Everything a durable journal can carry that POSITIVELY suggests the
+    write may have committed (none of it proves it): observed conversation,
+    uncorrelated write_completed events, persisted ACK metadata, bridge/POST
+    observations. Delegation-only is NOT positive write evidence (the WAL
+    marks delegation anyway); a bare weak turn_started is not either."""
+    observed = journal.get("conversationId")
+    if isinstance(observed, str) and observed.strip():
+        return True
+    if journal.get("networkEvidence"):
+        return True
+    if journal.get("uncorrelatedWriteEvents"):
+        return True
+    unconfirmed_ack = journal.get("unconfirmedAck")
+    if isinstance(unconfirmed_ack, dict):
+        ack_conversation = unconfirmed_ack.get("conversation_id")
+        if isinstance(ack_conversation, str) and ack_conversation.strip():
+            return True
+    return False
+
+
 
 
 class CwaFinalReviewTransport:
@@ -928,6 +978,17 @@ class CwaFinalReviewTransport:
             journal["submitError"] = str(error)
             journal["submitFailureLane"] = lane
             journal["finishedAt"] = _utc_now()
+            # Any write_completed frame observed BEFORE the loss is positive
+            # evidence (no ack ever returned, so none of it can be exactly
+            # correlated): persist it so the restart reconcile sees it.
+            streamed_completed = [
+                event
+                for event in events
+                if isinstance(event, dict)
+                and event.get("type") == _EVENT_WRITE_COMPLETED
+            ]
+            if streamed_completed:
+                journal["uncorrelatedWriteEvents"] = streamed_completed
             if lane == _LANE_PRE_DELEGATION:
                 self._update_journal(
                     journal, to_state=STATE_SUBMIT_FAILED_NONRETRYABLE
@@ -969,14 +1030,21 @@ class CwaFinalReviewTransport:
         journal["writeAckTier"] = tier
         if tier != "strong":
             # weak/correlated-only signals (Stop-button/streaming transitions,
-            # delegation/network frames, or ANOTHER submission's identity)
-            # must never terminalize WRITE_CONFIRMED: they are persisted as
-            # evidence and the journal falls into the reconcile lane.
+            # delegation/network frames, or ANOTHER/missing submission id on an
+            # otherwise-observed write) must never terminalize WRITE_CONFIRMED.
+            # BUT the positive evidence they carry is persisted durably so a
+            # post-restart reconcile can never collapse a real observation into
+            # NO_WRITE_PROVEN: a non-empty ACK conversation_id and/or any
+            # write_completed event become candidate/positive evidence. The typed
+            # SSE authority is NEVER taken from these events (authority_source was
+            # exact-correlation only), so this stays non-authoritative.
+            evidence_fields = _unconfirmed_write_evidence(journal, ack_dict, events)
             self._update_journal(
                 journal,
                 to_state=STATE_WRITE_FINALITY_UNKNOWN,
                 weakAckOnly=True,
                 finishedAt=_utc_now(),
+                **evidence_fields,
             )
             raise FinalReviewTransportError(
                 _transport_code("WRITE_FINALITY_UNKNOWN"),
@@ -1239,13 +1307,36 @@ class CwaFinalReviewTransport:
                     candidates.append(conversation_id.strip())
         # The observed conversation is scanned too - as a CANDIDATE only.
         observed = journal.get("conversationId")
-        has_positive_evidence = bool(
-            journal.get("networkEvidence")
-        )  # persisted bridge/POST observations
+        # Positive evidence is read from the DURABLE JOURNAL ONLY: an observed
+        # conversationId, persisted bridge/POST observations, uncorrelated
+        # write_completed events or an unconfirmed-ACK conversation - all
+        # survive restart. (Reconstructed here, never from caller memory.)
+        has_positive_evidence = _has_positive_write_evidence(journal)
         if isinstance(observed, str) and observed.strip():
-            has_positive_evidence = True
             if observed.strip() not in candidates:
                 candidates.append(observed.strip())
+        # An unconfirmed ACK naming a different conversation than the bound
+        # conversationId still contributes its own candidate + positive signal.
+        unconfirmed_ack = journal.get("unconfirmedAck")
+        if isinstance(unconfirmed_ack, dict):
+            ack_conversation = unconfirmed_ack.get("conversation_id")
+            if (
+                isinstance(ack_conversation, str)
+                and ack_conversation.strip()
+                and ack_conversation.strip() not in candidates
+            ):
+                candidates.append(ack_conversation.strip())
+        if journal.get("uncorrelatedWriteEvents"):
+            for event in journal["uncorrelatedWriteEvents"]:
+                event_conversation = (
+                    event.get("conversation_id") if isinstance(event, dict) else None
+                )
+                if (
+                    isinstance(event_conversation, str)
+                    and event_conversation.strip()
+                    and event_conversation.strip() not in candidates
+                ):
+                    candidates.append(event_conversation.strip())
         journal["reconcileScanCount"] = len(candidates)
 
         matches: list[tuple[str, str | None]] = []
