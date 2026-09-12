@@ -28,18 +28,14 @@ from chatgpt_web_adapter.final_review_binding_contract import (
     prompt_identity_hash,
 )
 from chatgpt_web_adapter.final_review_transport import (
-    CwaFinalReviewTransport,
-    FinalReviewTransportError,
     STATE_AMBIGUOUS,
     STATE_NO_WRITE_PROVEN,
-    STATE_PREPARED,
     STATE_RECONCILING,
     STATE_RESPONSE_CONFIRMED,
-    STATE_RESPONSE_WAIT,
     STATE_SUBMIT_DELEGATED,
-    STATE_WRITE_CONFIRMED,
     STATE_WRITE_FINALITY_UNKNOWN,
-    STATE_WRITE_FOUND,
+    CwaFinalReviewTransport,
+    FinalReviewTransportError,
 )
 
 REPO = "fixture/repo"
@@ -152,6 +148,17 @@ class TransactionRuntime:
             raise self.submit_error
         if self.mode == "weak_only":
             on_event({"type": "browser_native_turn_started", "submission_id": "sub-1"})
+            return FakeAck(CONV)
+        if self.mode == "missing_event_id":
+            # browser acks a submission id; the write_completed event omits its
+            # own submission_id -> cannot be exactly correlated.
+            on_event(
+                {
+                    "type": "browser_native_write_completed",
+                    "conversation_id": CONV,
+                    "sse_conversation_identity_authority": AUTHORITY,
+                }
+            )
             return FakeAck(CONV)
         if self.mode == "mismatched_ack":
             on_event(
@@ -676,3 +683,263 @@ def test_legacy_bound_journal_migrates_to_unknown_not_prepared(tmp_path):
         transport.reconcile_final_review(bound["canonicalRequestId"])
     assert _code(proven.value) == "NO_WRITE_PROVEN"
     assert proven.value.safe_to_retry is True
+
+
+# ===========================================================================
+# REWORK blocker 1: strict strong-ACK correlation (no fail-open)
+# ===========================================================================
+def _wc(submission_id="__omit__", authority=AUTHORITY):
+    event = {"type": "browser_native_write_completed", "conversation_id": CONV}
+    if submission_id != "__omit__":
+        event["submission_id"] = submission_id
+    if authority is not None:
+        event["sse_conversation_identity_authority"] = authority
+    return event
+
+
+def test_ack_missing_id_plus_foreign_write_completed_is_not_strong():
+    # ack WITHOUT submission id + foreign write_completed: never strong.
+    assert frt._classify_write_ack(
+        [_wc("B")], {"conversation_id": CONV}
+    ) != "strong"
+    assert frt._classify_write_ack(
+        [_wc("B")], {"submission_id": "", "conversation_id": CONV}
+    ) != "strong"
+    assert frt._strict_write_completed_event(
+        [_wc("B")], {"conversation_id": CONV}
+    ) is None
+
+
+def test_ack_id_with_event_missing_id_is_not_strong():
+    events = [_wc()]  # write_completed WITHOUT submission_id
+    assert frt._classify_write_ack(events, {"submission_id": "A"}) != "strong"
+    assert frt._strict_write_completed_event(events, {"submission_id": "A"}) is None
+
+
+def test_ack_id_with_foreign_event_id_is_not_strong():
+    events = [_wc("B")]
+    assert frt._classify_write_ack(events, {"submission_id": "A"}) == "correlated"
+    assert frt._strict_write_completed_event(events, {"submission_id": "A"}) is None
+
+
+def test_ack_id_with_exact_event_id_is_strong():
+    events = [_wc("B"), _wc("A")]
+    assert frt._classify_write_ack(events, {"submission_id": "A"}) == "strong"
+    assert (
+        frt._strict_write_completed_event(events, {"submission_id": "A"}).get(
+            "submission_id"
+        )
+        == "A"
+    )
+
+
+def test_typed_authority_only_from_exact_correlated_event():
+    # Foreign event carries the authority; the exact event does NOT: the
+    # authority must resolve to None (fails closed), never leak across.
+    foreign = _wc("B", authority=None)
+    foreign["sse_conversation_identity_authority"] = AUTHORITY
+    exact = _wc("A", authority=None)
+    source = frt._strict_write_completed_event([foreign, exact], {"submission_id": "A"})
+    assert source is exact
+    assert source.get("sse_conversation_identity_authority") is None
+
+
+def test_missing_id_write_completed_cannot_terminalize_end_to_end(tmp_path):
+    # Integration: browser plane acks a submission id; the event stream has a
+    # write_completed WITHOUT a submission id. Tier cannot be strong -> the
+    # journal must land in WRITE_FINALITY_UNKNOWN, not WRITE_CONFIRMED.
+    runtime = TransactionRuntime(
+        mode="missing_event_id",
+        emit_delegation=False,
+        conversations={},
+        recent=[],
+    )
+    with pytest.raises(FinalReviewTransportError) as raised:
+        _submit(runtime, tmp_path)
+    assert _code(raised.value) == "WRITE_FINALITY_UNKNOWN"
+    journal = _journal(tmp_path, _journal_id(tmp_path))
+    assert journal["state"] == STATE_WRITE_FINALITY_UNKNOWN
+    assert journal["writeAckTier"] == "correlated"
+
+
+# ===========================================================================
+# REWORK blocker 2: journal.conversationId is candidate evidence, NOT proof
+# ===========================================================================
+CONV2 = "7bb3b16e-ebe5-94fd-c36e-9140b48gd8ff"
+
+
+def _evidence_journal(*, observed=None, network=False):
+    bound = bind_final_review_request(
+        REPO,
+        ISSUE,
+        PR,
+        HEAD,
+        DIGEST,
+        expected_repository=REPO,
+        expected_issue_number=ISSUE,
+        expected_pull_request_number=PR,
+        current_head_sha=HEAD,
+        known_request_ids=set(),
+        prompt_sha256=prompt_identity_hash(PROMPT),
+    )
+    journal = {
+        "schema": 3,
+        "stateMachineVersion": 3,
+        "probe": "FINAL_REVIEW_TRANSPORT",
+        "mode": "REQUEST",
+        "state": STATE_WRITE_FINALITY_UNKNOWN,
+        "boundAt": frt._utc_now(),
+        "canonicalRequestId": bound["canonicalRequestId"],
+        "binding": bound,
+        "payloadText": PROMPT,
+        "liveWriteCount": 0,
+        "delegationAttempts": 1,
+    }
+    if observed is not None:
+        journal["conversationId"] = observed
+    if network:
+        journal["networkEvidence"] = [{"atMs": 1}]
+    return journal
+
+
+def _evidence_transport(tmp_path, conversations, recent):
+    runtime = TransactionRuntime(conversations=conversations, recent=recent)
+    transport = CwaFinalReviewTransport(
+        expected_repository=REPO,
+        expected_issue_number=ISSUE,
+        expected_pull_request_number=PR,
+        runtime_factory=lambda: runtime,
+        durable_store=tmp_path / "evidence-store",
+    )
+    return transport, runtime
+
+
+def test_observed_conversation_without_exact_turn_is_not_write_found(tmp_path):
+    # The observed conversation exists but contains NO exact prompt/turn:
+    # conversationId alone is NOT write proof.
+    transport, runtime = _evidence_transport(
+        tmp_path,
+        {CONV2: [_message("user", "unrelated conversation content", "u-x")]},
+        [CONV2],
+    )
+    journal = _evidence_journal(observed=CONV2)
+    matched, duplicate, conclusive, positive, notes = (
+        transport._collect_write_evidence(runtime, journal)
+    )
+    assert matched is None
+    assert duplicate is False
+    assert conclusive is True
+    assert positive is True  # observed conversation is positive evidence
+
+
+def test_observed_conversation_without_turn_reconciles_ambiguous(tmp_path):
+    # End-to-end: durable UNKNOWN + observed conversationId, history has no
+    # exact turn -> AMBIGUOUS (never WRITE_FOUND, never NO_WRITE_PROVEN).
+    runtime = TransactionRuntime(
+        submit_error=_lost_error(),
+        conversations={},
+        recent=[],
+    )
+    with pytest.raises(FinalReviewTransportError):
+        _submit(runtime, tmp_path)
+    request_id = _journal_id(tmp_path)
+    journal_path = tmp_path / "store" / f"{request_id}.json"
+    raw = json.loads(journal_path.read_text(encoding="utf-8"))
+    raw["conversationId"] = CONV2  # e.g. persisted route observation pre-loss
+    journal_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    probe = TransactionRuntime(
+        conversations={CONV2: [_message("user", "something else entirely", "u-q")]},
+        recent=[CONV2],
+    )
+    with pytest.raises(FinalReviewTransportError) as ambiguous:
+        _transport(probe, tmp_path).reconcile_final_review(request_id)
+    assert _code(ambiguous.value) == "AMBIGUOUS_FINALITY"
+    assert ambiguous.value.safe_to_retry is False
+    journal = _journal(tmp_path, request_id)
+    assert journal["state"] == STATE_AMBIGUOUS
+    assert journal["ambiguousReason"] == "POSITIVE_EVIDENCE_WITHOUT_EXACT_TURN"
+    assert probe.submit_calls == 0  # reconcile NEVER resends
+
+
+def test_observed_conversation_plus_network_reconciles_ambiguous(tmp_path):
+    runtime = TransactionRuntime(
+        submit_error=_lost_error(),
+        conversations={},
+        recent=[],
+        emit_write_observed=True,
+    )
+    with pytest.raises(FinalReviewTransportError):
+        _submit(runtime, tmp_path)
+    request_id = _journal_id(tmp_path)
+    journal_path = tmp_path / "store" / f"{request_id}.json"
+    raw = json.loads(journal_path.read_text(encoding="utf-8"))
+    raw["conversationId"] = CONV2
+    raw["networkEvidence"] = [{"atMs": 2}]
+    journal_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    probe = TransactionRuntime(conversations={CONV2: []}, recent=[CONV2])
+    with pytest.raises(FinalReviewTransportError) as ambiguous:
+        _transport(probe, tmp_path).reconcile_final_review(request_id)
+    assert _code(ambiguous.value) == "AMBIGUOUS_FINALITY"
+    assert _journal(tmp_path, request_id)["state"] == STATE_AMBIGUOUS
+    assert probe.submit_calls == 0
+
+
+def test_exact_turn_found_is_write_found_zero_resend(tmp_path):
+    # The exact prompt IS located in the observed conversation -> WRITE_FOUND.
+    runtime = TransactionRuntime(
+        submit_error=_lost_error(),
+        conversations={},
+        recent=[],
+    )
+    with pytest.raises(FinalReviewTransportError):
+        _submit(runtime, tmp_path)
+    request_id = _journal_id(tmp_path)
+    journal_path = tmp_path / "store" / f"{request_id}.json"
+    raw = json.loads(journal_path.read_text(encoding="utf-8"))
+    raw["conversationId"] = CONV2
+    journal_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    probe = TransactionRuntime(
+        conversations={
+            CONV2: [
+                _message("user", PROMPT, "u-1"),
+                _message("assistant", f"verdict for {HEAD}", "a-1"),
+            ]
+        },
+        recent=[CONV2],
+    )
+    result = _transport(probe, tmp_path).reconcile_final_review(request_id)
+    assert probe.submit_calls == 0
+    assert result.conversation_id == CONV2
+    assert _journal(tmp_path, request_id)["state"] == STATE_RESPONSE_CONFIRMED
+
+
+def test_clean_scan_without_any_positive_evidence_no_write_proven(tmp_path):
+    # No observed conversation, no network evidence, exact match nowhere:
+    # NO_WRITE_PROVEN is allowed only here.
+    transport, runtime = _evidence_transport(tmp_path, {}, [])
+    journal = _evidence_journal()
+    matched, duplicate, conclusive, positive, notes = (
+        transport._collect_write_evidence(runtime, journal)
+    )
+    assert matched is None and conclusive is True and positive is False
+
+
+def test_duplicate_exact_matches_reconcile_ambiguous(tmp_path):
+    # Two conversations BOTH located the exact prompt: a committed duplicate.
+    transport, runtime = _evidence_transport(
+        tmp_path,
+        {
+            CONV: [_message("user", PROMPT, "u-1")],
+            CONV2: [_message("user", PROMPT, "u-2")],
+        },
+        [CONV, CONV2],
+    )
+    journal = _evidence_journal()
+    matched, duplicate, conclusive, positive, notes = (
+        transport._collect_write_evidence(runtime, journal)
+    )
+    assert duplicate is True
+    assert positive is True

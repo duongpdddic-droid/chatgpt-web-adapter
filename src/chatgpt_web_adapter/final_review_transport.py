@@ -447,33 +447,65 @@ def _classify_submit_failure(error: BaseException) -> str:
     return _LANE_POST_DELEGATION
 
 
+def _is_correlation_text(value: Any) -> str:
+    """A submission/turn correlation id qualifies ONLY as a non-empty,
+    whitespace-stripped string. None/empty/non-string never correlate."""
+    return value if isinstance(value, str) and value.strip() else ""
+
+
+def _strict_write_completed_event(
+    events: list[dict[str, Any]], ack_dict: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The single write_completed event EXACTLY correlated to this ack.
+
+    Strong ONLY when all three hold: the ack's own submission_id is non-empty,
+    the event's submission_id is non-empty, and they are byte-equal. A missing
+    or foreign event id never qualifies - it cannot terminalize WRITE_CONFIRMED
+    nor supply the typed SSE identity authority.
+    """
+    ack_submission = _is_correlation_text(ack_dict.get("submission_id"))
+    if not ack_submission:
+        return None
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != _EVENT_WRITE_COMPLETED:
+            continue
+        event_submission = _is_correlation_text(event.get("submission_id"))
+        if event_submission and event_submission == ack_submission:
+            return event
+    return None
+
+
 def _classify_write_ack(
     events: list[dict[str, Any]], ack_dict: dict[str, Any]
 ) -> str:
     """Layered write-ack tier, correlated to this request's own events.
 
-    strong     - the browser-native write-completed event carrying the exact
-                 submission_id/turn identity: the only tier that may
-                 terminalize WRITE_CONFIRMED;
-    correlated - delegation/network frames present but no correlated
-                 write-completed event for this submission;
-    weak       - only turn_started/streaming/button transitions: never
-                 terminalizes WRITE_CONFIRMED (falls into UNKNOWN).
+    strong     - a browser-native write-completed event whose submission_id is
+                 non-empty and EXACTLY equals the ack's submission_id: the only
+                 tier that may terminalize WRITE_CONFIRMED;
+    correlated - a write-completed event exists but with a missing/foreign
+                 submission_id, or only delegation/network frames for this
+                 request: evidence, never WRITE_CONFIRMED;
+    weak       - only turn_started/streaming/button transitions.
+    Both correlated and weak fall through to WRITE_FINALITY_UNKNOWN.
     """
-    submission_id = ack_dict.get("submission_id")
+    if _strict_write_completed_event(events, ack_dict) is not None:
+        return "strong"
     for event in events:
-        if event.get("type") != _EVENT_WRITE_COMPLETED:
+        if not isinstance(event, dict):
             continue
-        event_submission = event.get("submission_id")
-        if submission_id is None or event_submission == submission_id:
-            return "strong"
-    for event in events:
         if event.get("type") in (
             _EVENT_DELEGATION_ACCEPTED,
             _EVENT_WRITE_OBSERVED,
         ):
             return "correlated"
+    for event in events:
+        if isinstance(event, dict) and event.get("type") == _EVENT_WRITE_COMPLETED:
+            # A write_completed that is NOT exactly correlated (missing or
+            # foreign submission_id): positive-looking but unproven.
+            return "correlated"
     return "weak"
+
 
 
 
@@ -835,7 +867,6 @@ class CwaFinalReviewTransport:
         4. the durable write ACK + typed identity evidence persist BEFORE any
            fail-closed gate, so reconciliation never loses the write evidence.
         """
-        canonical_request_id = journal["canonicalRequestId"]
         events: list[dict[str, Any]] = []
 
         try:
@@ -921,24 +952,19 @@ class CwaFinalReviewTransport:
         authority = None
         record_count = None
         distinct_count = None
-        # Authority is read off the write-completion event CORRELATED to this
-        # submission only - another request's identity can never authorize
-        # this journal's WRITE_CONFIRMED.
-        submission_id = ack_dict.get("submission_id")
-        for event in events:
-            if event.get("type") != _EVENT_WRITE_COMPLETED:
-                continue
-            if submission_id is not None and event.get("submission_id") not in (
-                None,
-                submission_id,
-            ):
-                continue
-            authority = event.get("sse_conversation_identity_authority")
-            record_count = event.get("sse_conversation_identity_record_count")
-            distinct_count = event.get(
+        # The typed SSE identity authority is read off the EXACTLY-correlated
+        # write_completed event only (both submission ids non-empty and equal).
+        # A foreign or missing-id event supplies NO authority: the identity gate
+        # then fails closed and the tier check routes to UNKNOWN.
+        authority_source = _strict_write_completed_event(events, ack_dict)
+        if authority_source is not None:
+            authority = authority_source.get("sse_conversation_identity_authority")
+            record_count = authority_source.get(
+                "sse_conversation_identity_record_count"
+            )
+            distinct_count = authority_source.get(
                 "sse_conversation_identity_distinct_count"
             )
-            break
         tier = _classify_write_ack(events, ack_dict)
         journal["writeAckTier"] = tier
         if tier != "strong":
@@ -1090,10 +1116,13 @@ class CwaFinalReviewTransport:
                 journal_state=STATE_RECONCILING,
                 reconcile_required=True,
             ) from error
-        matched, duplicate, conclusive, notes = self._collect_write_evidence(
-            runtime, journal
-        )
-        write_observed = bool(journal.get("networkEvidence"))
+        (
+            matched,
+            duplicate,
+            conclusive,
+            positive_evidence,
+            notes,
+        ) = self._collect_write_evidence(runtime, journal)
         if duplicate:
             self._update_journal(
                 journal,
@@ -1109,8 +1138,9 @@ class CwaFinalReviewTransport:
                 reconcile_required=False,
             )
         if matched is not None:
-            # WRITE_FOUND: the turn exists - zero resend; response recovery
-            # continues over correlated evidence bound to the immutable id.
+            # WRITE_FOUND: the exact prompt/turn was LOCATED via canonical/
+            # history evidence - zero resend; response recovery continues over
+            # correlated evidence bound to the immutable id.
             evidence_fields: dict[str, Any] = {}
             prior_observed = journal.get("conversationId")
             if prior_observed in (None, ""):
@@ -1131,7 +1161,7 @@ class CwaFinalReviewTransport:
                 to_state=STATE_AMBIGUOUS,
                 ambiguousReason="EVIDENCE_INCONCLUSIVE",
                 reconcileNotes=notes,
-                writeObservedEvidence=write_observed,
+                positiveEvidence=positive_evidence,
                 finishedAt=_utc_now(),
             )
             raise FinalReviewTransportError(
@@ -1140,13 +1170,15 @@ class CwaFinalReviewTransport:
                 safe_to_retry=False,
                 reconcile_required=False,
             )
-        if write_observed:
-            # Network evidence says the POST crossed the bridge but history
-            # cannot locate the turn: fail closed, a human must look.
+        if positive_evidence:
+            # A conversation and/or bridge/POST observation exists, but the
+            # canonical history could NOT locate the exact turn: the write can
+            # be neither confirmed nor disproven. journal.conversationId is
+            # correlation evidence, NEVER write proof -> AMBIGUOUS, human look.
             self._update_journal(
                 journal,
                 to_state=STATE_AMBIGUOUS,
-                ambiguousReason="WRITE_OBSERVED_WITHOUT_TURN",
+                ambiguousReason="POSITIVE_EVIDENCE_WITHOUT_EXACT_TURN",
                 reconcileNotes=notes,
                 finishedAt=_utc_now(),
             )
@@ -1163,6 +1195,7 @@ class CwaFinalReviewTransport:
             negativeProof={
                 "method": "HISTORY_SCAN_NO_MATCH",
                 "scannedConversations": int(journal.get("reconcileScanCount") or 0),
+                "positiveEvidence": False,
                 "notes": notes,
             },
         )
@@ -1170,8 +1203,18 @@ class CwaFinalReviewTransport:
 
     def _collect_write_evidence(
         self, runtime: Any, journal: dict[str, Any]
-    ) -> tuple[str | None, bool, bool, list[str]]:
-        """Returns (matchedConversationId, duplicate, conclusive, notes)."""
+    ) -> tuple[str | None, bool, bool, bool, list[str]]:
+        """Returns (matchedConversationId, duplicate, conclusive,
+        has_positive_evidence, notes).
+
+        WRITE_FOUND proof is EXACTLY one thing: a user turn whose composer-
+        normalized text or content fingerprint equals this request's durable
+        payload text, located through the canonical/history read plane. The
+        journal's observed conversationId is a scan CANDIDATE and positive
+        evidence at most - it is never a match by itself, because the
+        conversation may exist (created, POST observed) without the turn ever
+        landing in it.
+        """
         identity_payload = journal["binding"]["canonicalPayload"]
         expected = identity_payload.get("conversationId") or NO_PREASSIGNED_CONVERSATION
         payload_text = journal["payloadText"]
@@ -1185,15 +1228,24 @@ class CwaFinalReviewTransport:
         else:
             lister = getattr(client, "_list_recent_conversations", None)
             if not callable(lister):
-                return None, False, False, ["NEGATIVE_PROBE_UNAVAILABLE"]
+                return None, False, False, False, ["NEGATIVE_PROBE_UNAVAILABLE"]
             try:
                 items = lister(limit=_RECONCILE_SCAN_LIMIT) or []
             except Exception:
-                return None, False, False, ["NEGATIVE_PROBE_FAILED"]
+                return None, False, False, False, ["NEGATIVE_PROBE_FAILED"]
             for item in items:
                 conversation_id = item.get("id") if isinstance(item, dict) else None
                 if isinstance(conversation_id, str) and conversation_id.strip():
                     candidates.append(conversation_id.strip())
+        # The observed conversation is scanned too - as a CANDIDATE only.
+        observed = journal.get("conversationId")
+        has_positive_evidence = bool(
+            journal.get("networkEvidence")
+        )  # persisted bridge/POST observations
+        if isinstance(observed, str) and observed.strip():
+            has_positive_evidence = True
+            if observed.strip() not in candidates:
+                candidates.append(observed.strip())
         journal["reconcileScanCount"] = len(candidates)
 
         matches: list[tuple[str, str | None]] = []
@@ -1201,7 +1253,9 @@ class CwaFinalReviewTransport:
             try:
                 messages = runtime.get_messages(ConversationRef(conversation_id))
             except Exception:
-                return None, False, False, [f"READ_FAILED:{conversation_id}"]
+                return None, False, False, has_positive_evidence, [
+                    f"READ_FAILED:{conversation_id}"
+                ]
             for message in messages if isinstance(messages, list) else []:
                 item = message.to_dict() if hasattr(message, "to_dict") else message
                 if not isinstance(item, dict) or item.get("role") != "user":
@@ -1214,19 +1268,19 @@ class CwaFinalReviewTransport:
                     or _content_fingerprint(text) == payload_fingerprint
                 ):
                     matches.append((conversation_id, item.get("message_id")))
-        # The journal's own ACK-observed conversation counts once.
-        observed = journal.get("conversationId")
-        if (
-            isinstance(observed, str)
-            and observed
-            and not any(match[0] == observed for match in matches)
-        ):
-            matches.append((observed, None))
         if len(matches) > 1:
-            return matches[0][0], True, True, [f"MATCHES:{len(matches)}"]
+            # Several located turns = a committed duplicate: positive evidence
+            # AND unresolvable finality.
+            return matches[0][0], True, True, True, [f"MATCHES:{len(matches)}"]
         if matches:
-            return matches[0][0], False, True, [f"MATCH:{matches[0][0]}"]
-        return None, False, True, ["SCAN_CLEAN"]
+            return (
+                matches[0][0],
+                False,
+                True,
+                True,
+                [f"MATCH:{matches[0][0]}"],
+            )
+        return None, False, True, has_positive_evidence, ["SCAN_CLEAN"]
 
     def _recover_from_ack(
         self, journal: dict[str, Any]
